@@ -1,0 +1,35 @@
+name: 'Run Claude Code'
+description: 'Execute Claude Code with specified model and prompt'
+
+inputs:
+  prompt:
+    description: 'Prompt to pass to Claude Code'
+    required: true
+  model_name:
+    description: 'Claude model to use (sonnet, opus, haiku)'
+    required: false
+    default: "claude-sonnet-4-5-20250929"
+  max_turns:
+    description: 'Maximum number of turns'
+    required: false
+    default: '100'
+  allowed_tools:
+    description: 'Comma-separated list of allowed tools'
+    required: false
+    default: 'Bash,Write,Edit,MultiEdit,TodoWrite'
+  timeout_minutes:
+    description: 'Timeout in minutes for Claude Code execution'
+    required: false
+    default: '20'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Execute Claude Code
+      continue-on-error: true
+      uses: anthropics/claude-code-action@v1
+      with:
+        anthropic_api_key: ${{ env.ANTHROPIC_API_KEY }}
+        prompt: ${{ inputs.prompt }}
+        allowed_bots: '*' 
+        claude_args: "--model=${{ inputs.model_name }} --max-turns=${{ inputs.max_turns }} --allowed-tools ${{ inputs.allowed_tools }}"
