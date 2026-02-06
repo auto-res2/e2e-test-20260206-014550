@@ -915,5 +915,184 @@
     "experimental_code": "import re, math, torch\nfrom collections import defaultdict\nfrom datasets import load_dataset\nfrom transformers import AutoTokenizer, AutoModelForSeq2SeqLM\n\nANS_RE = re.compile(r\"The answer is\\s*(-?\\d+\\.?\\d*)\", re.IGNORECASE)\nNUM_RE = re.compile(r\"-?\\d+\\.?\\d*\")\n\ndef extract_answer(text: str):\n    m = ANS_RE.search(text)\n    if m:\n        return m.group(1)\n    nums = NUM_RE.findall(text.replace(\",\", \"\"))\n    return nums[-1] if nums else None\n\ndef split_rationale_answer(text: str):\n    # returns rationale (excluding answer sentence) and answer clause\n    idx = text.lower().rfind(\"the answer is\")\n    if idx == -1:\n        return text.strip(), \"\"\n    return text[:idx].strip(), text[idx:].strip()\n\ndef chunk_rationale(r: str, max_chunks: int = 6):\n    # lightweight chunking: split by newline; fallback to sentence-ish splitting.\n    parts = [p.strip() for p in r.split(\"\\n\") if p.strip()]\n    if len(parts) <= 1:\n        parts = [p.strip() for p in re.split(r\"(?<=[\\.!\\?])\\s+\", r) if p.strip()]\n    if not parts:\n        return []\n    # merge into <= max_chunks\n    if len(parts) <= max_chunks:\n        return parts\n    # simple merge: concatenate consecutive parts\n    step = math.ceil(len(parts) / max_chunks)\n    merged = []\n    for i in range(0, len(parts), step):\n        merged.append(\" \".join(parts[i:i+step]))\n    return merged[:max_chunks]\n\ndef mask_numbers(r: str):\n    # destroy evidential content while preserving length/fluency-ish\n    return re.sub(r\"-?\\d+\\.?\\d*\", \"X\", r)\n\ndef logp_text(model, tok, encoder_text, decoder_text, device):\n    enc = tok(encoder_text, return_tensors=\"pt\", truncation=True).to(device)\n    lab = tok(decoder_text, return_tensors=\"pt\", truncation=True).input_ids.to(device)\n    out = model(**enc, labels=lab)\n    n = (lab != tok.pad_token_id).sum().item()\n    return float(-out.loss.detach().cpu() * n)\n\ndef sample_cot(model, tok, question, n, max_new_tokens, temperature=0.7, top_p=0.95, device=\"cpu\", verify=False):\n    prefix = f\"Q: {question}\\nA: Let’s think step by step.\"\n    if verify:\n        prefix += \" Check for mistakes and contradictions.\"\n    prefix += \" End with 'The answer is <number>'.\"\n\n    enc = tok(prefix, return_tensors=\"pt\", truncation=True).to(device)\n    gen = model.generate(\n        **enc,\n        do_sample=True,\n        temperature=temperature,\n        top_p=top_p,\n        max_new_tokens=max_new_tokens,\n        num_return_sequences=n,\n    )\n    return prefix, tok.batch_decode(gen, skip_special_tokens=True)\n\ndef minimal_sufficient_prefix_len(model, tok, prefix, rationale, ans_text, Lr_full,\n                                 eps=0.5, max_chunks=6, device=\"cpu\"):\n    chunks = chunk_rationale(rationale, max_chunks=max_chunks)\n    if not chunks:\n        return 0\n    # find minimal k such that logp(ans|x, prefix+chunks[:k]) >= Lr_full - eps\n    for k in range(1, len(chunks)+1):\n        r_pref = \"\\n\".join(chunks[:k])\n        Lk = logp_text(model, tok, encoder_text=prefix + \"\\n\" + r_pref, decoder_text=ans_text, device=device)\n        if Lk >= (Lr_full - eps):\n            return len(tok(r_pref, add_special_tokens=False).input_ids)\n    # if never reaches, use full rationale length\n    return len(tok(rationale, add_special_tokens=False).input_ids)\n\ndef ces_adsc(model, tok, question,\n             K_short=4, K_long=4,\n             alpha=0.5, lam=2e-3, tau=1.0, eps=0.5,\n             p_stop=0.85, m_stop=0.35,\n             device=\"cpu\"):\n    base_cache = {}\n\n    def score_samples(prefix, samples):\n        per_answer = defaultdict(float)\n        out_toks = 0\n        for t in samples:\n            ans = extract_answer(t)\n            if ans is None:\n                continue\n            rationale, _ = split_rationale_answer(t)\n            out_toks += len(tok(t, add_special_tokens=False).input_ids)\n\n            ans_text = f\"The answer is {ans}.\"\n            if ans not in base_cache:\n                base_cache[ans] = logp_text(model, tok, encoder_text=prefix, decoder_text=ans_text, device=device)\n            L0 = base_cache[ans]\n\n            # Score using rationale-only to reduce answer leakage\n            Lr = logp_text(model, tok, encoder_text=prefix + \"\\n\" + rationale, decoder_text=ans_text, device=device)\n            Lcf = logp_text(model, tok, encoder_text=prefix + \"\\n\" + mask_numbers(rationale), decoder_text=ans_text, device=device)\n\n            EG = Lr - L0              # evidence gain beyond priors\n            CC = Lr - Lcf             # counterfactual contribution (content matters)\n\n            l_star = minimal_sufficient_prefix_len(model, tok, prefix, rationale, ans_text, Lr,\n                                                   eps=eps, max_chunks=6, device=device)\n            score = EG + alpha * CC - lam * l_star\n            per_answer[ans] += math.exp(score / max(tau, 1e-6))\n        return per_answer, out_toks\n\n    def posterior(weights):\n        if not weights:\n            return None, None, None\n        Z = sum(weights.values())\n        items = sorted(((a, w/Z) for a, w in weights.items()), key=lambda x: x[1], reverse=True)\n        top1a, top1p = items[0]\n        top2p = items[1][1] if len(items) > 1 else 0.0\n        return top1a, top1p, top1p - top2p\n\n    # Stage 1\n    prefix, s1 = sample_cot(model, tok, question, n=K_short, max_new_tokens=64, device=device, verify=False)\n    w, tok_used = score_samples(prefix, s1)\n    a1, p1, m1 = posterior(w)\n    if a1 is None:\n        return None, tok_used, 1\n    if (p1 >= p_stop) or (m1 >= m_stop):\n        return a1, tok_used, 1\n\n    # Stage 2 (verification)\n    _, s2 = sample_cot(model, tok, question, n=K_long, max_new_tokens=256, device=device, verify=True)\n    w2, tok2 = score_samples(prefix, s2)\n    for a, ww in w2.items():\n        w[a] += ww\n    a2, _, _ = posterior(w)\n    return a2, tok_used + tok2, 2\n\nif __name__ == \"__main__\":\n    device = \"cuda\" if torch.cuda.is_available() else \"cpu\"\n    tok = AutoTokenizer.from_pretrained(\"google/flan-t5-base\")\n    model = AutoModelForSeq2SeqLM.from_pretrained(\"google/flan-t5-base\").to(device)\n\n    ds = load_dataset(\"gsm8k\", \"main\", split=\"test\").shuffle(seed=0).select(range(200))\n\n    correct = total = 0\n    tot_tokens = stage2 = 0\n    for ex in ds:\n        pred, used_toks, st = ces_adsc(model, tok, ex[\"question\"], device=device)\n        gold = extract_answer(ex[\"answer\"])\n        if pred is not None and gold is not None:\n            correct += int(pred == gold)\n            total += 1\n        tot_tokens += used_toks\n        stage2 += int(st == 2)\n\n    print({\n        \"accuracy\": correct / max(total, 1),\n        \"n\": total,\n        \"avg_gen_tokens\": tot_tokens / len(ds),\n        \"stage2_rate\": stage2 / len(ds),\n    })\n",
     "expected_result": "On GSM8K (n=200) with flan-t5-base (temperature sampling):\n- Direct (no CoT): ~0.18–0.25 accuracy\n- SC-Majority (K=10, 256 tokens): ~0.22–0.30\n- BoN-AnsLogP: ~0.23–0.31\n- Meta-PMI-ADSC: ~0.27–0.36\n- CES-ADSC (proposed): ~0.29–0.38\n\nCompute/efficiency (secondary):\n- CES-ADSC should reduce average generated tokens by ~25–45% vs fixed SC-Majority, with stage2_rate ~30–55% depending on p_stop/m_stop.\n\nSafety/faithfulness proxy (secondary, diagnostic):\n- Mean CC (=Lr−Lcf) should be higher on correct predictions than incorrect ones (expected separation ~0.5–1.5 nats), indicating CC tracks evidential reliance better than EG alone.\n\nOn SVAMP/ASDiv (n=200): expect similar relative ordering, with CES-ADSC +0.01–0.03 absolute over Meta-PMI-ADSC and +0.03–0.06 over SC-Majority.",
     "expected_conclusion": "CES-ADSC strengthens CoT self-consistency by turning “confidence” from a fluency/verbosity proxy into an *evidence-with-counterfactuals* signal: a rationale is trusted only insofar as (i) it raises the answer probability beyond the prior (EG) and (ii) its *specific content* matters (CC), approximated by perturbation-based counterfactual testing. In addition, it estimates a minimal sufficient rationale prefix ℓ* and penalizes that quantity, aligning aggregation with human cognitive economy (“stop once enough evidence is assembled”) rather than blunt length penalties.\n\nAcademic value: the hypothesis reframes SC-CoT aggregation as counterfactual evidence accumulation with an explicit sufficiency test, connecting LLM inference-time reasoning to ideas from causal attribution and minimal explanations—yet remains training-free and broadly applicable.\n\nPractical/social value: by down-weighting rationales that do not survive counterfactual perturbations and by early-stopping when evidence is decisive, the method aims to reduce both (a) verbose hallucinated explanations and (b) inference cost/energy, improving deployability in education and decision-support settings where unfaithful explanations can mislead users."
+  },
+  "experimental_design": {
+    "experiment_summary": "Goal: evaluate inference-time answer selection for grade-school math word problems. Given a word problem x, the system must output the final numeric answer (not a full solution). We compare a new training-free self-consistency aggregation rule (CES-ADSC) against a strong inference-only baseline (Meta-PMI-ADSC) while holding the underlying LM fixed.\n\nTask workflow (per example):\n1) Prompt an LM to generate K chain-of-thought (CoT) traces that end with a canonical answer sentence “The answer is <number>.”\n2) Parse each trace into rationale r_i (everything before the last “The answer is …”) and answer a_i.\n3) For each unique answer a, compute teacher-forced log-likelihoods of the canonical answer string y(a) under (i) the question only, (ii) question + rationale, and (iii) question + a perturbed rationale that preserves surface form but destroys content (e.g., number masking). These scores quantify how much the rationale causally supports the answer vs. merely increasing fluency or leaking the answer.\n4) Aggregate per-sample scores into a weighted self-consistency vote and output the top answer.\n5) Adaptive deliberation: run a short Stage-1 sampling pass; early-exit if posterior mass/margin is high; otherwise run a longer Stage-2 “verification” sampling pass.\n\nScale fit to the provided Runner (H200 140GB VRAM, 240GB RAM):\n- Use a single, small-ish model (Flan-T5-base, ~250M) to make multiple teacher-forced scoring passes cheap.\n- Evaluate on a script-feasible subset of GSM8K test (n=200) to keep total generation + scoring within minutes-hours on one GPU.\n- Hyperparameter selection (optional) is done on a tiny GSM8K validation slice (n=50) via Optuna with limited trials (<=20). No model training.\n- Generation budgets are capped (Stage-1: short traces max_new_tokens=64; Stage-2: long traces max_new_tokens=256) and early-exit reduces average compute.",
+    "runner_config": {
+      "runner_label": [
+        "self-hosted",
+        "gpu-runner"
+      ],
+      "description": "NVIDIA H200, VRAM: 140 GB, RAM: 240 GB"
+    },
+    "evaluation_metrics": [
+      {
+        "name": "accuracy",
+        "description": "Correctness criteria: A prediction is correct if the extracted numeric value from the model output equals the gold numeric value from the dataset solution. Extract numbers by (a) first matching the explicit pattern /The answer is\\s*(-?\\d+\\.?\\d*)/i; if absent, fall back to the last number-like substring in the output after removing commas. Normalize by stripping whitespace and leading plus signs; treat integers and decimals as exact strings after normalization (GSM8K answers are typically integers).\n\nCalculation method: accuracy = (# correct predictions) / (N), where N is the number of evaluated examples with both a parsed gold answer and a parsed predicted answer.\n\nTask appropriateness: GSM8K is a closed-form numeric QA task; accuracy directly measures whether the final answer is right, regardless of the particular reasoning trace.\n\nRelevant visualizations: (1) Bar chart of accuracy by method; (2) bootstrap 95% CI error bars for accuracy; (3) histogram of per-problem answer frequency for error analysis (optional)."
+      },
+      {
+        "name": "avg_generated_tokens",
+        "description": "Correctness criteria: Not applicable (efficiency metric).\n\nCalculation method: For each example, count the number of generated tokens across all sampled traces (Stage-1 plus Stage-2 if triggered) using the model tokenizer with add_special_tokens=False. Report mean across the evaluation set.\n\nTask appropriateness: CES-ADSC claims instance-adaptive compute; average generated tokens is a direct proxy for inference cost/latency/energy.\n\nRelevant visualizations: (1) Boxplot/violin plot of tokens per example; (2) scatter plot of tokens vs. correctness (correct/incorrect colored)."
+      },
+      {
+        "name": "stage2_rate",
+        "description": "Correctness criteria: Not applicable (efficiency/control metric).\n\nCalculation method: stage2_rate = (# examples that trigger Stage-2 verification) / N_eval.\n\nTask appropriateness: Directly quantifies how often adaptive deliberation decides that additional reasoning is necessary.\n\nRelevant visualizations: (1) Single bar with confidence interval; (2) histogram of posterior top-1 probability after Stage-1 with the stop threshold marked."
+      },
+      {
+        "name": "cc_separation",
+        "description": "Correctness criteria: Not a correctness metric; diagnostic for faithfulness.\n\nCalculation method: For each sampled trace t_i, compute CC_i = Lr − Lcf (counterfactual contribution). Group traces by whether the final aggregated prediction for the example is correct. Report Δ = mean(CC | correct) − mean(CC | incorrect) and/or an effect size (Cohen’s d).\n\nTask appropriateness: The hypothesis is that counterfactual contribution detects content-dependent rationales and correlates with correctness better than evidence-gain alone.\n\nRelevant visualizations: (1) Overlaid density plots of CC for correct vs. incorrect; (2) mean±SE bar chart; (3) ROC curve for using CC to predict correctness (optional)."
+      }
+    ],
+    "models_to_use": [
+      "google/flan-t5-base (~250M parameters)"
+    ],
+    "datasets_to_use": [
+      "openai/gsm8k (main)"
+    ],
+    "proposed_method": {
+      "method_name": "CES-ADSC (Counterfactual Evidence & Sufficiency–Weighted Self-Consistency with Adaptive Deliberation)",
+      "description": "Training-free CoT aggregation that weights each sampled answer by (i) evidence gain beyond priors (EG = log p(y|x,r) − log p(y|x)), (ii) counterfactual contribution of rationale content (CC = log p(y|x,r) − log p(y|x, r~) where r~ masks numbers/operators to preserve fluency but destroy evidence), and (iii) a minimal-sufficient rationale prefix penalty ℓ* (smallest rationale prefix achieving near-full support within ε of full-rationale logp). Uses two-stage adaptive deliberation: early-exit after short traces if posterior mass/margin is high; otherwise sample longer verification traces and re-aggregate.",
+      "optuna_config": {
+        "enabled": true,
+        "n_trials": 20,
+        "search_spaces": [
+          {
+            "param_name": "alpha",
+            "distribution_type": "categorical",
+            "choices": [
+              0.0,
+              0.5,
+              1.0
+            ]
+          },
+          {
+            "param_name": "lambda_len",
+            "distribution_type": "categorical",
+            "choices": [
+              0.0,
+              0.001,
+              0.002,
+              0.005
+            ]
+          },
+          {
+            "param_name": "epsilon",
+            "distribution_type": "categorical",
+            "choices": [
+              0.2,
+              0.5
+            ]
+          },
+          {
+            "param_name": "p_stop",
+            "distribution_type": "categorical",
+            "choices": [
+              0.75,
+              0.85
+            ]
+          },
+          {
+            "param_name": "m_stop",
+            "distribution_type": "categorical",
+            "choices": [
+              0.25,
+              0.35
+            ]
+          },
+          {
+            "param_name": "tau",
+            "distribution_type": "categorical",
+            "choices": [
+              0.7,
+              1.0,
+              1.3
+            ]
+          },
+          {
+            "param_name": "K_short",
+            "distribution_type": "categorical",
+            "choices": [
+              3,
+              4,
+              5
+            ]
+          },
+          {
+            "param_name": "K_long",
+            "distribution_type": "categorical",
+            "choices": [
+              3,
+              4,
+              6
+            ]
+          }
+        ]
+      }
+    },
+    "comparative_methods": [
+      {
+        "method_name": "Meta-PMI-ADSC (Evidence-Gain Self-Consistency with Adaptive Deliberation)",
+        "description": "Strong inference-only baseline that approximates rationale support using only evidence gain EG = log p(y|x,r) − log p(y|x) (PMI-style) with a simple length penalty on the full rationale length (no counterfactual perturbation, no minimal-sufficient prefix). Uses the same two-stage adaptive sampling/verification schedule and the same parsing rule that excludes the final answer sentence from scoring to control answer leakage.",
+        "optuna_config": {
+          "enabled": true,
+          "n_trials": 20,
+          "search_spaces": [
+            {
+              "param_name": "lambda_len",
+              "distribution_type": "categorical",
+              "choices": [
+                0.0,
+                0.001,
+                0.002,
+                0.005
+              ]
+            },
+            {
+              "param_name": "p_stop",
+              "distribution_type": "categorical",
+              "choices": [
+                0.75,
+                0.85
+              ]
+            },
+            {
+              "param_name": "m_stop",
+              "distribution_type": "categorical",
+              "choices": [
+                0.25,
+                0.35
+              ]
+            },
+            {
+              "param_name": "tau",
+              "distribution_type": "categorical",
+              "choices": [
+                0.7,
+                1.0,
+                1.3
+              ]
+            },
+            {
+              "param_name": "K_short",
+              "distribution_type": "categorical",
+              "choices": [
+                3,
+                4,
+                5
+              ]
+            },
+            {
+              "param_name": "K_long",
+              "distribution_type": "categorical",
+              "choices": [
+                3,
+                4,
+                6
+              ]
+            }
+          ]
+        }
+      }
+    ]
   }
 }
