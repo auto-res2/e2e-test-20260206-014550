@@ -1,0 +1,46 @@
+run_id: comparative-1-flan-t5-base-gsm8k
+method: Meta-PMI-ADSC (Evidence-Gain Self-Consistency with Adaptive Deliberation)
+model:
+  name: google/flan-t5-base
+  precision: fp16
+  max_new_tokens_stage1: 64
+  max_new_tokens_stage2: 256
+  temperature: 0.7
+  top_p: 0.95
+dataset:
+  name: openai/gsm8k
+  subset: main
+  split: test
+  subset_size: 200
+  shuffle: true
+  shuffle_seed: 0
+  preprocessing:
+    max_length: 512
+training:
+  enabled: false
+  learning_rate: 0.0
+  batch_size: 1
+  epochs: 0
+  optimizer: none
+  warmup_steps: 0
+optuna:
+  n_trials: 20
+  search_spaces:
+    - param_name: lambda_len
+      distribution_type: categorical
+      choices: [0.0, 0.001, 0.002, 0.005]
+    - param_name: p_stop
+      distribution_type: categorical
+      choices: [0.75, 0.85]
+    - param_name: m_stop
+      distribution_type: categorical
+      choices: [0.25, 0.35]
+    - param_name: tau
+      distribution_type: categorical
+      choices: [0.7, 1.0, 1.3]
+    - param_name: K_short
+      distribution_type: categorical
+      choices: [3, 4, 5]
+    - param_name: K_long
+      distribution_type: categorical
+      choices: [3, 4, 6]

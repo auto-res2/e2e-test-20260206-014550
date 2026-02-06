@@ -1,1 +1,24 @@
-# Please list the required python packages.
+[project]
+name = "ces-adsc-experiments"
+version = "0.1.0"
+description = "CES-ADSC inference experiments with Hydra"
+requires-python = ">=3.10"
+dependencies = [
+  "torch>=2.1.0",
+  "transformers>=4.38.0",
+  "datasets>=2.17.0",
+  "hydra-core>=1.3.2",
+  "wandb>=0.16.0",
+  "optuna>=3.5.0",
+  "numpy>=1.24.0",
+  "pandas>=2.0.0",
+  "scipy>=1.10.0",
+  "matplotlib>=3.7.0",
+  "seaborn>=0.13.0",
+  "tqdm>=4.66.0",
+  "sentencepiece>=0.1.99"
+]
+
+[build-system]
+requires = ["setuptools>=65.0"]
+build-backend = "setuptools.build_meta"

@@ -1,0 +1,21 @@
+defaults:
+  - run: proposed-flan-t5-base-gsm8k
+  - _self_
+
+mode: full
+results_dir: ./results
+seed: 42
+
+wandb:
+  entity: airas
+  project: 2026-02-06
+  mode: online
+
+hydra:
+  run:
+    dir: ${results_dir}/${run.run_id}
+  sweep:
+    dir: ${results_dir}/multirun
+  job:
+    chdir: false
+  output_subdir: null
